@@ -1,0 +1,14 @@
+.env
+*.pdf
+*.wav
+*.mp3
+*.mp4
+*.m4a
+*.m4v
+*.m4b
+*.m4p
+*.m4r
+*.m4v
+*.m4b
+__pycache__/
+.DS_Store
