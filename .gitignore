@@ -12,3 +12,4 @@
 *.m4b
 __pycache__/
 .DS_Store
+prompts/
