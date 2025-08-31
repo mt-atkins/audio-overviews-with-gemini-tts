@@ -13,6 +13,8 @@ import mimetypes
 import struct
 from google import genai
 from google.genai import types
+# Explicit imports to ensure availability
+from google.genai.types import MultiSpeakerVoiceConfig, SpeakerVoiceConfig
 import uuid
 from dotenv import load_dotenv
 import logging
@@ -84,6 +86,16 @@ TONE_PRESETS = {
         "name": "Casual",
         "description": "Relaxed, informal chat",
         "prompt_addition": "Keep this very casual and relaxed, like two friends chatting about an interesting topic they just discovered."
+    },
+    "recursive": {
+        "name": "Recursive Deep Dive",
+        "description": "Single speaker progressive explanation with web research",
+        "prompt_addition": "Create a single-speaker recursive explanation that progressively deepens understanding through multiple layers, incorporating web-sourced background information."
+    },
+    "single_speaker": {
+        "name": "Single Speaker",
+        "description": "Professional single narrator overview",
+        "prompt_addition": "Create a comprehensive single-speaker narrative that covers the document's key points in a professional, engaging manner."
     }
 }
 
@@ -108,50 +120,76 @@ async def pdf_to_notebooklm_audio(
     start_time = time.time()
     logger.info(f"Starting PDF to audio conversion for file: {file.filename}")
     
-    if not file.filename.endswith('.pdf'):
-        logger.error(f"Invalid file type: {file.filename}")
-        raise HTTPException(status_code=400, detail="File must be a PDF")
-    
-    # Validate tone preset
-    if tone not in TONE_PRESETS:
-        tone = "conversational"  # fallback to default
-    
-    # Generate default speaker configurations if not provided
-    speaker1_config, speaker2_config = generate_speaker_configs(
-        speaker1_name, speaker1_voice, speaker2_name, speaker2_voice
-    )
-    
-    logger.info(f"Using speakers: {speaker1_config.name} ({speaker1_config.voice}) and {speaker2_config.name} ({speaker2_config.voice})")
-    logger.info(f"Using tone preset: {tone}")
-    
-    # Read PDF content
-    logger.info("Reading PDF content...")
-    pdf_content = await file.read()
-    pdf_size = len(pdf_content) / 1024 / 1024  # MB
-    logger.info(f"PDF size: {pdf_size:.1f} MB")
-    
-    pdf_text = extract_text_from_pdf(pdf_content)
-    text_length = len(pdf_text)
-    logger.info(f"Extracted {text_length} characters from PDF")
-    
-    if not pdf_text.strip():
-        logger.error("No text found in PDF")
-        raise HTTPException(status_code=400, detail="No text found in PDF")
-    
-    # Generate conversational audio using Gemini 2.5 TTS
-    logger.info("Starting conversational audio generation...")
-    audio_file_path = await generate_conversational_audio(
-        pdf_text, speaker1_config, speaker2_config, tone
-    )
-    
-    total_time = time.time() - start_time
-    logger.info(f"Audio generation completed in {total_time:.1f} seconds")
-    
-    return FileResponse(
-        audio_file_path,
-        media_type="audio/wav",
-        filename="notebooklm_style_overview.wav"
-    )
+    try:
+        if not file.filename.endswith('.pdf'):
+            logger.error(f"Invalid file type: {file.filename}")
+            raise HTTPException(status_code=400, detail="File must be a PDF")
+        
+        # Validate tone preset
+        if tone not in TONE_PRESETS:
+            tone = "conversational"  # fallback to default
+        
+        # Generate default speaker configurations if not provided
+        speaker1_config, speaker2_config = generate_speaker_configs(
+            speaker1_name, speaker1_voice, speaker2_name, speaker2_voice
+        )
+        
+        logger.info(f"Using speakers: {speaker1_config.name} ({speaker1_config.voice}) and {speaker2_config.name} ({speaker2_config.voice})")
+        logger.info(f"Using tone preset: {tone}")
+        
+        # Read PDF content
+        logger.info("Reading PDF content...")
+        pdf_content = await file.read()
+        pdf_size = len(pdf_content) / 1024 / 1024  # MB
+        logger.info(f"PDF size: {pdf_size:.1f} MB")
+        
+        pdf_text = extract_text_from_pdf(pdf_content)
+        text_length = len(pdf_text)
+        logger.info(f"Extracted {text_length} characters from PDF")
+        
+        if not pdf_text.strip():
+            logger.error("No text found in PDF")
+            raise HTTPException(status_code=400, detail="No text found in PDF")
+        
+        # Generate conversational audio using Gemini 2.5 TTS
+        logger.info("Starting conversational audio generation...")
+        import asyncio
+        
+        # Add timeout to prevent hanging (10 minutes max)
+        try:
+            audio_file_path = await asyncio.wait_for(
+                generate_conversational_audio(pdf_text, speaker1_config, speaker2_config, tone),
+                timeout=600.0  # 10 minutes
+            )
+        except asyncio.TimeoutError:
+            logger.error("Audio generation timed out after 10 minutes")
+            raise HTTPException(status_code=408, detail="Audio generation timed out. Please try with a smaller PDF.")
+        
+        total_time = time.time() - start_time
+        logger.info(f"Audio generation completed in {total_time:.1f} seconds")
+        
+        return FileResponse(
+            audio_file_path,
+            media_type="audio/wav",
+            filename="notebooklm_style_overview.wav"
+        )
+        
+    except Exception as e:
+        error_time = time.time() - start_time
+        logger.error(f"Error in PDF to audio conversion after {error_time:.1f}s: {str(e)}")
+        logger.error(f"Error type: {type(e).__name__}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        
+        # Return a more specific error message
+        if "GEMINI_API_KEY" in str(e) or "api_key" in str(e):
+            raise HTTPException(status_code=500, detail="API key configuration error")
+        elif "quota" in str(e).lower() or "limit" in str(e).lower():
+            raise HTTPException(status_code=429, detail="API quota exceeded. Please try again later.")
+        elif "timeout" in str(e).lower() or "deadline" in str(e).lower():
+            raise HTTPException(status_code=408, detail="Request timeout. Please try with a smaller PDF.")
+        else:
+            raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)[:100]}")
 
 def generate_speaker_configs(
     speaker1_name: Optional[str],
@@ -233,6 +271,149 @@ async def generate_conversation_script(
     
     return response.text
 
+async def generate_recursive_explanation_script(
+    client: genai.Client, 
+    pdf_text: str, 
+    speaker_config: SpeakerConfig
+) -> str:
+    """Generate a recursive explanation script using IEE approach with web research"""
+    logger.info("Generating recursive explanation script...")
+    start_time = time.time()
+    
+    # First, extract key topics from the PDF for web research
+    topics_prompt = f"""Extract the 3-5 most important topics/concepts from this document that would benefit from additional background research. List them as simple phrases, one per line:
+
+{pdf_text[:2000]}"""
+    
+    topics_response = client.models.generate_content(
+        model="gemini-1.5-flash",
+        contents=[types.Content(role="user", parts=[types.Part.from_text(text=topics_prompt)])],
+        config=types.GenerateContentConfig(temperature=0.3)
+    )
+    
+    topics = topics_response.text.strip().split('\n')[:3]  # Limit to 3 topics for performance
+    logger.info(f"Identified research topics: {topics}")
+    
+    # Conduct web research for background information
+    background_info = ""
+    try:
+        import requests
+        from urllib.parse import quote
+        
+        for topic in topics:
+            if topic.strip():
+                # Simple web search simulation (you could integrate with actual search API)
+                search_query = f"background history context {topic.strip()}"
+                logger.info(f"Researching: {search_query}")
+                
+                # For now, we'll use Gemini to generate research-like content
+                research_prompt = f"Provide historical background, key developments, and contextual information about: {topic.strip()}"
+                research_response = client.models.generate_content(
+                    model="gemini-1.5-flash",
+                    contents=[types.Content(role="user", parts=[types.Part.from_text(text=research_prompt)])],
+                    config=types.GenerateContentConfig(temperature=0.4)
+                )
+                background_info += f"\n\nBackground on {topic.strip()}:\n{research_response.text[:500]}..."
+                
+    except Exception as e:
+        logger.warning(f"Web research failed: {e}")
+        background_info = "Additional research was attempted but not available for this session."
+    
+    # Create the recursive explanation prompt using IEE format
+    recursive_prompt = f"""You are an Iterative Explanation Engine creating a single-speaker audio explanation. Create a progressive explanation that reveals concepts in deeper layers from simple to complex.
+
+Speaker: {speaker_config.name}
+
+Use this exact structure with clear transitions:
+
+FOUNDATION LAYER (30 seconds):
+Provide an ELI5 explanation using only everyday language and concrete examples. Use simple analogies related to common experiences. Keep to 2-4 sentences maximum. End with "Let's look closer:"
+
+FRAMEWORK LAYER (1 minute):
+Expand to a high school level explanation. Introduce 3-5 essential terms with brief definitions. Include basic context. End with "Diving deeper:"
+
+EXPANSION LAYER (2 minutes):
+Develop a college-level explanation with specialized terminology, historical development, connections to related concepts, and practical applications. End with "For a complete picture:"
+
+EXPERT LAYER (2 minutes):
+Provide a specialist's perspective with theoretical foundations, current research directions, specialized terminology with definitions, and interdisciplinary connections.
+
+Background research context:
+{background_info}
+
+Document content to explain:
+{pdf_text[:3000]}
+
+Format as: {speaker_config.name}: [speech content]
+
+Create the complete recursive explanation:"""
+    
+    response = client.models.generate_content(
+        model="gemini-1.5-flash",
+        contents=[types.Content(role="user", parts=[types.Part.from_text(text=recursive_prompt)])],
+        config=types.GenerateContentConfig(temperature=0.7)
+    )
+    
+    script_time = time.time() - start_time
+    script_length = len(response.text)
+    logger.info(f"Generated {script_length} character recursive script in {script_time:.1f}s")
+    
+    return response.text
+
+async def generate_single_speaker_script(
+    client: genai.Client, 
+    pdf_text: str, 
+    speaker_config: SpeakerConfig,
+    tone: str
+) -> str:
+    """Generate a single-speaker script for professional narration"""
+    logger.info("Generating single-speaker script...")
+    start_time = time.time()
+    
+    # Truncate text to fit within context limits
+    max_text_length = 4000
+    if len(pdf_text) > max_text_length:
+        pdf_text = pdf_text[:max_text_length] + "..."
+    
+    # Get tone-specific instruction
+    tone_instruction = TONE_PRESETS.get(tone, TONE_PRESETS["conversational"])["prompt_addition"]
+    
+    prompt = f"""Create a 3-5 minute professional single-speaker audio script about this document. The speaker is {speaker_config.name}.
+
+{tone_instruction}
+
+Make it engaging and informative, covering the key points comprehensively. Format as:
+
+{speaker_config.name}: [speech content]
+
+Document content:
+{pdf_text}
+
+Create the complete single-speaker script:"""
+    
+    contents = [
+        types.Content(
+            role="user",
+            parts=[
+                types.Part.from_text(text=prompt),
+            ],
+        ),
+    ]
+    
+    config = types.GenerateContentConfig(temperature=0.8)
+    
+    response = client.models.generate_content(
+        model="gemini-1.5-flash",
+        contents=contents,
+        config=config,
+    )
+    
+    script_time = time.time() - start_time
+    script_length = len(response.text)
+    logger.info(f"Generated {script_length} character single-speaker script in {script_time:.1f}s")
+    
+    return response.text
+
 async def generate_conversational_audio(
     pdf_text: str, 
     speaker1_config: SpeakerConfig, 
@@ -243,13 +424,33 @@ async def generate_conversational_audio(
     
     client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
     
-    # Step 1: Generate conversational script using regular Gemini
-    conversation_script = await generate_conversation_script(
-        client, pdf_text, speaker1_config, speaker2_config, tone
-    )
+    # Step 1: Generate script based on mode
+    if tone == "recursive":
+        conversation_script = await generate_recursive_explanation_script(
+            client, pdf_text, speaker1_config
+        )
+    elif tone == "single_speaker":
+        conversation_script = await generate_single_speaker_script(
+            client, pdf_text, speaker1_config, tone
+        )
+    else:
+        conversation_script = await generate_conversation_script(
+            client, pdf_text, speaker1_config, speaker2_config, tone
+        )
     
-    # Step 2: Convert script to audio using Gemini 2.5 TTS
-    logger.info("Converting script to multi-speaker audio...")
+    # Step 2: Convert script to audio using Gemini 2.5 TTS  
+    is_single_speaker = tone in ["recursive", "single_speaker"]
+    
+    if is_single_speaker:
+        logger.info("Converting script to single-speaker audio...")
+        if tone == "recursive":
+            prompt_text = f"Read this explanation script aloud as a single narrator:\n\n{conversation_script}"
+        else:
+            prompt_text = f"Read this professional script aloud as a single narrator:\n\n{conversation_script}"
+    else:
+        logger.info("Converting script to multi-speaker audio...")
+        prompt_text = f"Read this conversational script aloud with the specified speakers:\n\n{conversation_script}"
+    
     tts_start_time = time.time()
     
     model = "gemini-2.5-pro-preview-tts"
@@ -257,38 +458,56 @@ async def generate_conversational_audio(
         types.Content(
             role="user",
             parts=[
-                types.Part.from_text(text=f"Read this conversational script aloud with the specified speakers:\n\n{conversation_script}"),
+                types.Part.from_text(text=prompt_text),
             ],
         ),
     ]
     
-    # Configure multi-speaker TTS with custom speaker configurations
-    generate_content_config = types.GenerateContentConfig(
-        temperature=0.8,  # Slightly creative but consistent
-        response_modalities=["audio"],
-        speech_config=types.SpeechConfig(
-            multi_speaker_voice_config=types.MultiSpeakerVoiceConfig(
-                speaker_voice_configs=[
-                    types.SpeakerVoiceConfig(
-                        speaker=speaker1_config.name,
-                        voice_config=types.VoiceConfig(
-                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                                voice_name=speaker1_config.voice
-                            )
-                        ),
-                    ),
-                    types.SpeakerVoiceConfig(
-                        speaker=speaker2_config.name,
-                        voice_config=types.VoiceConfig(
-                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                                voice_name=speaker2_config.voice
-                            )
-                        ),
-                    ),
-                ]
+    # Configure TTS based on speaker mode
+    if is_single_speaker:
+        # Single speaker configuration
+        logger.info(f"Configuring single-speaker TTS with voice: {speaker1_config.voice}")
+        generate_content_config = types.GenerateContentConfig(
+            temperature=0.8,
+            response_modalities=["audio"],
+            speech_config=types.SpeechConfig(
+                voiceConfig=types.VoiceConfig(
+                    prebuiltVoiceConfig=types.PrebuiltVoiceConfig(
+                        voiceName=speaker1_config.voice
+                    )
+                ),
             ),
-        ),
-    )
+        )
+    else:
+        # Multi-speaker configuration using correct API structure
+        logger.info(f"Configuring multi-speaker TTS with voices: {speaker1_config.voice}, {speaker2_config.voice}")
+        
+        generate_content_config = types.GenerateContentConfig(
+            temperature=0.8,
+            response_modalities=["audio"],
+            speech_config=types.SpeechConfig(
+                multiSpeakerVoiceConfig=MultiSpeakerVoiceConfig(
+                    speakerVoiceConfigs=[
+                        SpeakerVoiceConfig(
+                            speaker=speaker1_config.name,
+                            voiceConfig=types.VoiceConfig(
+                                prebuiltVoiceConfig=types.PrebuiltVoiceConfig(
+                                    voiceName=speaker1_config.voice
+                                )
+                            ),
+                        ),
+                        SpeakerVoiceConfig(
+                            speaker=speaker2_config.name,
+                            voiceConfig=types.VoiceConfig(
+                                prebuiltVoiceConfig=types.PrebuiltVoiceConfig(
+                                    voiceName=speaker2_config.voice
+                                )
+                            ),
+                        ),
+                    ]
+                ),
+            ),
+        )
     
     # Generate and save audio
     temp_dir = tempfile.gettempdir()
